@@ -1,9 +1,10 @@
-// server.js
+// FriendListChatserver.js
 const express = require("express");
 const http = require("http");
 const cors = require("cors");
 const { Server } = require("socket.io");
 const admin = require("firebase-admin");
+const seventhServiceAccount = require("./seventhServiceAccountKey.json");
 
 const app = express();
 app.use(cors());
@@ -28,44 +29,20 @@ const HEARTBEAT_DROP_MS = 14000; // 14s without ping = lost internet
 // ==============================================================
 let seventhFirestore = null;
 
-function initSeventhDbAdmin() {
-  try {
-    let serviceAccount = null;
-
-    if (process.env.SEVENTH_DB_SERVICE_ACCOUNT) {
-      const raw = process.env.SEVENTH_DB_SERVICE_ACCOUNT.trim();
-      if (raw.startsWith("{")) {
-        serviceAccount = JSON.parse(raw);
-      } else {
-        serviceAccount = JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
-      }
-    } else {
-      try {
-        serviceAccount = require("./serviceAccountKey.json");
-      } catch (e) {}
-    }
-
-    if (!serviceAccount) {
-      console.warn(
-        "⚠️ [7thDB] SEVENTH_DB_SERVICE_ACCOUNT env var not set. 24h backend Firestore sweeper is paused until configured."
-      );
-      return;
-    }
-
-    const appInst = admin.initializeApp(
-      { credential: admin.credential.cert(serviceAccount) },
-      "seventhDbAdmin"
-    );
-    seventhFirestore = admin.firestore(appInst);
-    console.log("✅ [7thDB] Firebase Admin connected for 24h offline message auto-deletion.");
-  } catch (err) {
-    console.error("❌ [7thDB] Failed to initialize Firebase Admin:", err.message);
-  }
+try {
+  const seventhApp = admin.initializeApp(
+    {
+      credential: admin.credential.cert(seventhServiceAccount),
+    },
+    "seventhDbAdmin"
+  );
+  seventhFirestore = admin.firestore(seventhApp);
+  console.log("✅ [7thDB] Firebase Admin connected via seventhServiceAccountKey.json.");
+} catch (err) {
+  console.error("❌ [7thDB] Failed to initialize Firebase Admin:", err.message);
 }
 
-initSeventhDbAdmin();
-
-// Track rooms that recently received offline messages as a fallback if collectionGroup index is still building
+// Track rooms that recently received offline messages as a fallback if collectionGroup index isn't created yet
 const activeOfflineRoomIds = new Set();
 
 async function sweepExpiredFirestoreMessages() {
@@ -100,7 +77,7 @@ async function sweepExpiredFirestoreMessages() {
   } catch (err) {
     // Fallback Strategy: Scan FriendListChat rooms directly if collectionGroup index isn't created yet
     console.warn(
-      "⚠️ [24h Sweeper] collectionGroup query fallback (create single-field exemption index on `messages.expiresAt` if needed):",
+      "⚠️ [24h Sweeper] collectionGroup fallback (create single-field exemption index on `messages.expiresAt` if needed):",
       err.message
     );
 
@@ -161,14 +138,10 @@ setInterval(() => sweepExpiredFirestoreMessages().catch(() => {}), SWEEP_INTERVA
 // ==============================================================
 // 🧠 IN-MEMORY LIVE STATE (ZERO FIRESTORE LOAD FOR SIGNALING)
 // ==============================================================
-// uid -> { socketId, uid, email, name, image, isVip, currentRoomId, targetUid, inCall, protectedUntil, lastPing }
-const onlineUsers = new Map();
-// emailLower -> uid
-const emailToUid = new Map();
-// socketId -> uid
-const socketToUid = new Map();
-// roomId -> { members: Set<uid>, activeThemeId: string|null, memberStates: Map<uid, object> }
-const rooms = new Map();
+const onlineUsers = new Map(); // uid -> user record
+const emailToUid = new Map(); // emailLower -> uid
+const socketToUid = new Map(); // socketId -> uid
+const rooms = new Map(); // roomId -> { members: Set<uid>, activeThemeId, memberStates: Map }
 
 function getOrCreateRoom(roomId) {
   if (!rooms.has(roomId)) {
@@ -234,7 +207,6 @@ function handleUserLeavingRoom(uid, roomId, reason = "left_chat") {
     user.inCall = false;
   }
 
-  // Notify partner (whether inside the chat room OR on the My Friends "Live 👀" tab)
   const watchPayload = {
     roomId: targetRoomId,
     watcherUid: uid,
@@ -290,7 +262,7 @@ setInterval(() => {
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    service: "FriendListLiveSocketServer",
+    service: "FriendListChatserver",
     onlineUsers: onlineUsers.size,
     activeRooms: rooms.size,
     seventhDbConnected: Boolean(seventhFirestore),
@@ -318,7 +290,6 @@ io.on("connection", (socket) => {
     const emailLower = email ? String(email).toLowerCase() : null;
     const prev = onlineUsers.get(uid);
 
-    // Replace stale socket mapping cleanly on reconnect
     if (prev && prev.socketId && prev.socketId !== socket.id) {
       socketToUid.delete(prev.socketId);
     }
@@ -348,7 +319,7 @@ io.on("connection", (socket) => {
     ack?.({ ok: true, onlineCount: onlineUsers.size });
   });
 
-  // 2. Query who is currently waiting in chat rooms with me (Powers My Friends "Live 👀" tab!)
+  // 2. Query who is currently waiting in chat rooms with me (Powers My Friends "Live 👀" tab)
   socket.on("friend_get_live_watchers", (data = {}, ack) => {
     const myUid = data.uid || socketToUid.get(socket.id);
     if (!myUid) {
@@ -439,7 +410,6 @@ io.on("connection", (socket) => {
       joinedAt: Date.now(),
     });
 
-    // Notify partner (both inside the room AND on My Friends screen) that I joined
     const watchPayload = {
       roomId,
       watcherUid: uid,
@@ -457,7 +427,6 @@ io.on("connection", (socket) => {
       emitToUser(resolvedTargetUid, targetEmail, "friend_watch_status", watchPayload);
     }
 
-    // Check if partner is ALREADY inside this room
     const partnerInRoom = getPartnerInRoom(roomId, uid);
     const partnerState = partnerInRoom
       ? room.memberStates.get(partnerInRoom.uid) || null
@@ -510,7 +479,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  // 6. Gallery / Camera / Call Setup Protection (Prevents false background disconnect)
+  // 6. Gallery / Camera / Call Setup Protection
   socket.on("friend_set_protection", (data = {}) => {
     const uid = data.uid || socketToUid.get(socket.id);
     const user = onlineUsers.get(uid);
@@ -544,7 +513,7 @@ io.on("connection", (socket) => {
   });
 
   // ==============================================================
-  // 📡 CHAT WEBRTC SIGNALING (REPLACES FIRESTORE `chatOffer`/`chatAnswer`/ICE!)
+  // 📡 CHAT WEBRTC SIGNALING (ZERO FIRESTORE READS/WRITES)
   // ==============================================================
   socket.on("friend_chat_webrtc_offer", (data = {}) => {
     const { roomId, offer, offerId, role, senderUid, senderEmail } = data;
@@ -612,7 +581,6 @@ io.on("connection", (socket) => {
 
     socket.to(roomId).emit("friend_call_signal", packet);
 
-    // Also route directly to target socket if they haven't joined the room channel yet (e.g., incoming call alert)
     if (targetUid || targetEmail) {
       const targetUser = getUserByUidOrEmail(targetUid, targetEmail);
       if (targetUser && targetUser.currentRoomId !== roomId) {
@@ -643,7 +611,7 @@ io.on("connection", (socket) => {
   });
 
   // ==============================================================
-  // 💬 HYBRID MESSAGE ROUTER (SOCKET WHEN PARTNER IN ROOM, FIRESTORE ONLY WHEN OFFLINE)
+  // 💬 HYBRID MESSAGE ROUTER (SOCKET WHEN IN ROOM, FIRESTORE ONLY WHEN OFFLINE)
   // ==============================================================
   socket.on("friend_hybrid_message", (data = {}, ack) => {
     const { roomId, targetUid, targetEmail, eventType = "MESSAGE", payload } = data;
@@ -674,10 +642,8 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // Track this room for 24h fallback sweeping if client stores offline message in Firestore
     activeOfflineRoomIds.add(roomId);
 
-    // If partner is online on another screen (e.g. My Friends), ping unread indicator instantly
     if (targetUser && targetUser.socketId) {
       io.to(targetUser.socketId).emit("friend_unread_notification", {
         roomId,
@@ -690,7 +656,7 @@ io.on("connection", (socket) => {
     ack?.({ ok: true, deliveredVia: "offline", inRoom: false });
   });
 
-  // Live theme / reaction / typing / voice-translate / gift / privacy events inside room
+  // Live theme / reaction / typing / voice-translate / gift / privacy events
   socket.on("friend_chat_event", (data = {}) => {
     const { roomId, eventType, payload } = data;
     if (!roomId || !eventType) return;
@@ -742,11 +708,9 @@ io.on("connection", (socket) => {
     if (!uid) return;
 
     const user = onlineUsers.get(uid);
-    // Only act if this socket is still the active socket for this uid
     if (!user || user.socketId !== socket.id) return;
 
     const now = Date.now();
-    // Respect gallery / camera protection window briefly before declaring drop
     if (user.protectedUntil && now < user.protectedUntil) {
       const waitMs = Math.min(12000, user.protectedUntil - now + 1000);
       setTimeout(() => {
@@ -770,5 +734,5 @@ io.on("connection", (socket) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 FriendList Live Socket Server running on port ${PORT}`);
+  console.log(`🚀 FriendListChatserver running on port ${PORT}`);
 });
