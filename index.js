@@ -15,7 +15,7 @@ const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] },
   pingInterval: 10000,
   pingTimeout: 15000,
-  maxHttpBufferSize: 20 * 1024 * 1024, // 20MB buffer for voice/avatar/media fallbacks
+  maxHttpBufferSize: 20 * 1024 * 1024, // 20MB buffer for voice/avatar/media relays
   transports: ["websocket", "polling"],
 });
 
@@ -42,98 +42,96 @@ try {
   console.error("❌ [7thDB] Failed to initialize Firebase Admin:", err.message);
 }
 
-// Track rooms that recently received offline messages as a fallback if collectionGroup index isn't created yet
+// Tracks rooms that recently received offline messages in Firestore `seventhDb`
 const activeOfflineRoomIds = new Set();
 
+// Scans `FriendListChat/{roomId}/messages` directly (Spark-plan friendly, zero custom indexes needed)
 async function sweepExpiredFirestoreMessages() {
-  if (!seventhFirestore) return { deleted: 0, skipped: true };
+  if (!seventhFirestore) {
+    return { deletedMessages: 0, deletedRooms: 0, skipped: true };
+  }
 
   const now = Date.now();
   const cutoff24h = now - OFFLINE_MSG_TTL_MS;
-  let totalDeleted = 0;
+  let deletedMessages = 0;
+  let deletedRooms = 0;
 
-  // Primary Strategy: Fast collectionGroup('messages') query across all FriendListChat rooms
   try {
-    let hasMore = true;
-    while (hasMore) {
-      const snap = await seventhFirestore
-        .collectionGroup("messages")
-        .where("expiresAt", "<=", now)
-        .limit(400)
-        .get();
+    const roomRefs = await seventhFirestore
+      .collection("FriendListChat")
+      .listDocuments();
 
-      if (snap.empty) {
-        hasMore = false;
-        break;
+    const allRoomIds = new Set([
+      ...roomRefs.map((r) => r.id),
+      ...Array.from(activeOfflineRoomIds),
+    ]);
+
+    for (const roomId of allRoomIds) {
+      const roomDocRef = seventhFirestore
+        .collection("FriendListChat")
+        .doc(roomId);
+      const messagesColRef = roomDocRef.collection("messages");
+      const msgSnap = await messagesColRef.get();
+
+      if (msgSnap.empty) {
+        // Delete empty parent room doc (also cleans up legacy signaling fields)
+        await roomDocRef.delete().catch(() => {});
+        activeOfflineRoomIds.delete(roomId);
+        deletedRooms += 1;
+        continue;
       }
 
-      const batch = seventhFirestore.batch();
-      snap.docs.forEach((docSnap) => batch.delete(docSnap.ref));
-      await batch.commit();
-      totalDeleted += snap.size;
+      const expiredDocs = [];
+      let remainingCount = 0;
 
-      if (snap.size < 400) hasMore = false;
+      msgSnap.docs.forEach((d) => {
+        const data = d.data() || {};
+        const exp = Number(data.expiresAt) || 0;
+        const ts = Number(data.timestamp) || 0;
+        const isExpired =
+          (exp > 0 && exp <= now) || (ts > 0 && ts <= cutoff24h);
+
+        if (isExpired) {
+          expiredDocs.push(d);
+        } else {
+          remainingCount += 1;
+        }
+      });
+
+      if (expiredDocs.length > 0) {
+        for (let i = 0; i < expiredDocs.length; i += 400) {
+          const slice = expiredDocs.slice(i, i + 400);
+          const batch = seventhFirestore.batch();
+          slice.forEach((d) => batch.delete(d.ref));
+          await batch.commit();
+          deletedMessages += slice.length;
+        }
+      }
+
+      if (remainingCount === 0) {
+        await roomDocRef.delete().catch(() => {});
+        activeOfflineRoomIds.delete(roomId);
+        deletedRooms += 1;
+      }
     }
   } catch (err) {
-    // Fallback Strategy: Scan FriendListChat rooms directly if collectionGroup index isn't created yet
-    console.warn(
-      "⚠️ [24h Sweeper] collectionGroup fallback (create single-field exemption index on `messages.expiresAt` if needed):",
-      err.message
+    console.error("❌ [7thDB 24h Sweeper] Error:", err.message);
+  }
+
+  if (deletedMessages > 0 || deletedRooms > 0) {
+    console.log(
+      `🧹 [7thDB 24h Sweeper] Purged ${deletedMessages} expired message(s) and ${deletedRooms} empty room doc(s).`
     );
-
-    try {
-      const roomRefs = await seventhFirestore
-        .collection("FriendListChat")
-        .listDocuments();
-
-      const allRoomIds = new Set([
-        ...roomRefs.map((r) => r.id),
-        ...Array.from(activeOfflineRoomIds),
-      ]);
-
-      for (const roomId of allRoomIds) {
-        const msgSnap = await seventhFirestore
-          .collection("FriendListChat")
-          .doc(roomId)
-          .collection("messages")
-          .get();
-
-        if (msgSnap.empty) {
-          activeOfflineRoomIds.delete(roomId);
-          continue;
-        }
-
-        const expiredDocs = msgSnap.docs.filter((d) => {
-          const data = d.data() || {};
-          const exp = Number(data.expiresAt) || 0;
-          const ts = Number(data.timestamp) || 0;
-          return (exp > 0 && exp <= now) || (ts > 0 && ts <= cutoff24h);
-        });
-
-        if (expiredDocs.length > 0) {
-          for (let i = 0; i < expiredDocs.length; i += 400) {
-            const slice = expiredDocs.slice(i, i + 400);
-            const batch = seventhFirestore.batch();
-            slice.forEach((d) => batch.delete(d.ref));
-            await batch.commit();
-            totalDeleted += slice.length;
-          }
-        }
-      }
-    } catch (fallbackErr) {
-      console.error("❌ [24h Sweeper] Fallback sweep error:", fallbackErr.message);
-    }
   }
-
-  if (totalDeleted > 0) {
-    console.log(`🧹 [24h Sweeper] Deleted ${totalDeleted} expired offline message(s).`);
-  }
-  return { deleted: totalDeleted, timestamp: now };
+  return { deletedMessages, deletedRooms, timestamp: now };
 }
 
 // Run initial sweep 15s after boot, then every 10 minutes
 setTimeout(() => sweepExpiredFirestoreMessages().catch(() => {}), 15000);
-setInterval(() => sweepExpiredFirestoreMessages().catch(() => {}), SWEEP_INTERVAL_MS);
+setInterval(
+  () => sweepExpiredFirestoreMessages().catch(() => {}),
+  SWEEP_INTERVAL_MS
+);
 
 // ==============================================================
 // 🧠 IN-MEMORY LIVE STATE (ZERO FIRESTORE LOAD FOR SIGNALING)
@@ -191,7 +189,8 @@ function handleUserLeavingRoom(uid, roomId, reason = "left_chat") {
   if (!targetRoomId) return;
 
   const room = rooms.get(targetRoomId);
-  const targetUid = user?.targetUid || getPartnerInRoom(targetRoomId, uid)?.uid || null;
+  const targetUid =
+    user?.targetUid || getPartnerInRoom(targetRoomId, uid)?.uid || null;
 
   if (room) {
     room.members.delete(uid);
@@ -250,7 +249,9 @@ setInterval(() => {
 
     if (now - (user.lastPing || 0) > HEARTBEAT_DROP_MS) {
       const droppedRoomId = user.currentRoomId;
-      console.log(`⚠️ [Heartbeat Timeout] User ${uid} lost connection in room ${droppedRoomId}`);
+      console.log(
+        `⚠️ [Heartbeat Timeout] User ${uid} lost connection in room ${droppedRoomId}`
+      );
       handleUserLeavingRoom(uid, droppedRoomId, "lost_internet");
     }
   }
@@ -265,6 +266,7 @@ app.get("/health", (req, res) => {
     service: "FriendListChatserver",
     onlineUsers: onlineUsers.size,
     activeRooms: rooms.size,
+    trackedOfflineRooms: activeOfflineRoomIds.size,
     seventhDbConnected: Boolean(seventhFirestore),
     uptimeSec: Math.round(process.uptime()),
   });
@@ -423,8 +425,13 @@ io.on("connection", (socket) => {
     };
 
     socket.to(roomId).emit("friend_watch_status", watchPayload);
-    if (resolvedTargetUid) {
-      emitToUser(resolvedTargetUid, targetEmail, "friend_watch_status", watchPayload);
+    if (resolvedTargetUid || targetEmail) {
+      emitToUser(
+        resolvedTargetUid,
+        targetEmail,
+        "friend_watch_status",
+        watchPayload
+      );
     }
 
     const partnerInRoom = getPartnerInRoom(roomId, uid);
@@ -456,7 +463,8 @@ io.on("connection", (socket) => {
 
   // 4. Explicit Leave Room (Back button / Background / Unmount)
   socket.on("friend_user_left_chat", (data = {}) => {
-    const uid = data.watcherUid || data.senderUid || socketToUid.get(socket.id);
+    const uid =
+      data.watcherUid || data.senderUid || socketToUid.get(socket.id);
     if (!uid) return;
     const roomId = data.roomId || onlineUsers.get(uid)?.currentRoomId;
     if (roomId) socket.leave(roomId);
@@ -565,7 +573,15 @@ io.on("connection", (socket) => {
   // 📞 AUDIO & VIDEO CALL SIGNALING + LIVE FEATURES SYNC
   // ==============================================================
   socket.on("friend_call_signal", (data = {}) => {
-    const { roomId, targetUid, targetEmail, signalType, payload, senderUid, senderEmail } = data;
+    const {
+      roomId,
+      targetUid,
+      targetEmail,
+      signalType,
+      payload,
+      senderUid,
+      senderEmail,
+    } = data;
     if (!roomId || !signalType) return;
 
     const uid = senderUid || socketToUid.get(socket.id);
@@ -597,7 +613,11 @@ io.on("connection", (socket) => {
     const room = rooms.get(roomId);
     if (room && uid) {
       const prevState = room.memberStates.get(uid) || {};
-      room.memberStates.set(uid, { ...prevState, ...data, updatedAt: Date.now() });
+      room.memberStates.set(uid, {
+        ...prevState,
+        ...data,
+        updatedAt: Date.now(),
+      });
       if (data.themeId) {
         room.activeThemeId = data.themeId;
       }
@@ -614,8 +634,15 @@ io.on("connection", (socket) => {
   // 💬 HYBRID MESSAGE ROUTER (SOCKET WHEN IN ROOM, FIRESTORE ONLY WHEN OFFLINE)
   // ==============================================================
   socket.on("friend_hybrid_message", (data = {}, ack) => {
-    const { roomId, targetUid, targetEmail, eventType = "MESSAGE", payload } = data;
+    const {
+      roomId,
+      targetUid,
+      targetEmail,
+      eventType = "MESSAGE",
+      payload,
+    } = data;
     const senderUid = data.senderUid || socketToUid.get(socket.id);
+
     if (!roomId) {
       ack?.({ ok: false, deliveredVia: "offline", inRoom: false });
       return;
@@ -623,6 +650,22 @@ io.on("connection", (socket) => {
 
     const room = rooms.get(roomId);
     const targetUser = getUserByUidOrEmail(targetUid, targetEmail);
+
+    // Client already saved an offline message to Firestore seventhDb -> register room for 24h sweeper
+    if (eventType === "OFFLINE_TRACK_ONLY") {
+      activeOfflineRoomIds.add(roomId);
+      if (targetUser && targetUser.socketId && targetUser.currentRoomId !== roomId) {
+        io.to(targetUser.socketId).emit("friend_unread_notification", {
+          roomId,
+          fromUid: senderUid,
+          fromEmail: data.senderEmail,
+          timestamp: Date.now(),
+        });
+      }
+      ack?.({ ok: true, tracked: true });
+      return;
+    }
+
     const isTargetInRoom = Boolean(
       targetUser &&
         targetUser.currentRoomId === roomId &&
@@ -678,24 +721,36 @@ io.on("connection", (socket) => {
   });
 
   // ==============================================================
-  // 🗑️ INSTANT BACKEND DELETE OF SEEN FIRESTORE MESSAGES
+  // 🗑️ INSTANT BACKEND DELETE OF SEEN FIRESTORE MESSAGES + EMPTY ROOM CLEANUP
   // ==============================================================
   socket.on("friend_mark_firestore_seen", async (data = {}) => {
     const { roomId, messageIds } = data;
-    if (!seventhFirestore || !roomId || !Array.isArray(messageIds) || messageIds.length === 0) {
+    if (
+      !seventhFirestore ||
+      !roomId ||
+      !Array.isArray(messageIds) ||
+      messageIds.length === 0
+    ) {
       return;
     }
     try {
-      const batch = seventhFirestore.batch();
-      const colRef = seventhFirestore
+      const roomDocRef = seventhFirestore
         .collection("FriendListChat")
-        .doc(roomId)
-        .collection("messages");
+        .doc(roomId);
+      const colRef = roomDocRef.collection("messages");
 
+      const batch = seventhFirestore.batch();
       messageIds.slice(0, 400).forEach((id) => {
         if (id) batch.delete(colRef.doc(String(id)));
       });
       await batch.commit();
+
+      // Remove parent room doc if no unseen messages remain
+      const remainingSnap = await colRef.limit(1).get();
+      if (remainingSnap.empty) {
+        await roomDocRef.delete().catch(() => {});
+        activeOfflineRoomIds.delete(roomId);
+      }
     } catch (e) {}
   });
 
