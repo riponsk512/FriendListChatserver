@@ -13,16 +13,18 @@ app.use(express.json());
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] },
-  pingInterval: 10000,
-  pingTimeout: 15000,
-  maxHttpBufferSize: 20 * 1024 * 1024, // 20MB buffer for voice/avatar/media relays
+  pingInterval: 15000,
+  pingTimeout: 30000,
+  maxHttpBufferSize: 20 * 1024 * 1024,
   transports: ["websocket", "polling"],
 });
 
 const PORT = process.env.PORT || 4000;
 const OFFLINE_MSG_TTL_MS = 24 * 60 * 60 * 1000; // 24 Hours
-const SWEEP_INTERVAL_MS = 10 * 60 * 1000; // Run 24h cleanup every 10 minutes
-const HEARTBEAT_DROP_MS = 14000; // 14s without ping = lost internet
+const SWEEP_INTERVAL_MS = 10 * 60 * 1000; // Every 10 minutes
+const HEARTBEAT_DROP_MS = 45000; // 45s safety ceiling (only if socket is ALSO dead)
+const CHAT_DISCONNECT_GRACE_MS = 10000; // 10s reconnect grace in chat
+const CALL_DISCONNECT_GRACE_MS = 18000; // 18s reconnect grace during active call
 
 // ==============================================================
 // 🔥 FIREBASE ADMIN INIT FOR `seventhDb` (24-HOUR AUTO-DELETE SWEEPER)
@@ -42,10 +44,8 @@ try {
   console.error("❌ [7thDB] Failed to initialize Firebase Admin:", err.message);
 }
 
-// Tracks rooms that recently received offline messages in Firestore `seventhDb`
 const activeOfflineRoomIds = new Set();
 
-// Scans `FriendListChat/{roomId}/messages` directly (Spark-plan friendly, zero custom indexes needed)
 async function sweepExpiredFirestoreMessages() {
   if (!seventhFirestore) {
     return { deletedMessages: 0, deletedRooms: 0, skipped: true };
@@ -74,7 +74,6 @@ async function sweepExpiredFirestoreMessages() {
       const msgSnap = await messagesColRef.get();
 
       if (msgSnap.empty) {
-        // Delete empty parent room doc (also cleans up legacy signaling fields)
         await roomDocRef.delete().catch(() => {});
         activeOfflineRoomIds.delete(roomId);
         deletedRooms += 1;
@@ -126,7 +125,6 @@ async function sweepExpiredFirestoreMessages() {
   return { deletedMessages, deletedRooms, timestamp: now };
 }
 
-// Run initial sweep 15s after boot, then every 10 minutes
 setTimeout(() => sweepExpiredFirestoreMessages().catch(() => {}), 15000);
 setInterval(
   () => sweepExpiredFirestoreMessages().catch(() => {}),
@@ -134,12 +132,21 @@ setInterval(
 );
 
 // ==============================================================
-// 🧠 IN-MEMORY LIVE STATE (ZERO FIRESTORE LOAD FOR SIGNALING)
+// 🧠 IN-MEMORY LIVE STATE (ZERO FIRESTORE FOR LIVE SIGNALING)
 // ==============================================================
 const onlineUsers = new Map(); // uid -> user record
 const emailToUid = new Map(); // emailLower -> uid
 const socketToUid = new Map(); // socketId -> uid
 const rooms = new Map(); // roomId -> { members: Set<uid>, activeThemeId, memberStates: Map }
+const disconnectTimers = new Map(); // uid -> timeoutHandle
+
+function cancelPendingDisconnect(uid) {
+  const t = disconnectTimers.get(uid);
+  if (t) {
+    clearTimeout(t);
+    disconnectTimers.delete(uid);
+  }
+}
 
 function getOrCreateRoom(roomId) {
   if (!rooms.has(roomId)) {
@@ -183,14 +190,38 @@ function getPartnerInRoom(roomId, myUid) {
   return null;
 }
 
-function handleUserLeavingRoom(uid, roomId, reason = "left_chat") {
+function getWatchersForUser(myUid, myEmailLower) {
+  const watchers = [];
+  for (const [uid, u] of onlineUsers.entries()) {
+    if (uid === myUid || !u.currentRoomId) continue;
+    const matchesUid = u.targetUid && u.targetUid === myUid;
+    const matchesEmail =
+      myEmailLower && u.targetEmail && u.targetEmail === myEmailLower;
+    if (matchesUid || matchesEmail) {
+      watchers.push({
+        watcherUid: u.uid,
+        email: u.email,
+        name: u.name,
+        image: u.image,
+        roomId: u.currentRoomId,
+        isVip: Boolean(u.isVip),
+        updatedAt: u.lastPing || Date.now(),
+      });
+    }
+  }
+  return watchers;
+}
+
+function handleUserLeavingRoom(uid, roomId, reason = "back_button") {
+  cancelPendingDisconnect(uid);
   const user = onlineUsers.get(uid);
   const targetRoomId = roomId || user?.currentRoomId;
   if (!targetRoomId) return;
 
   const room = rooms.get(targetRoomId);
-  const targetUid =
-    user?.targetUid || getPartnerInRoom(targetRoomId, uid)?.uid || null;
+  const partner = getPartnerInRoom(targetRoomId, uid);
+  const targetUid = user?.targetUid || partner?.uid || null;
+  const targetEmail = user?.targetEmail || partner?.email || null;
 
   if (room) {
     room.members.delete(uid);
@@ -203,6 +234,7 @@ function handleUserLeavingRoom(uid, roomId, reason = "left_chat") {
   if (user && user.currentRoomId === targetRoomId) {
     user.currentRoomId = null;
     user.targetUid = null;
+    user.targetEmail = null;
     user.inCall = false;
   }
 
@@ -210,52 +242,47 @@ function handleUserLeavingRoom(uid, roomId, reason = "left_chat") {
     roomId: targetRoomId,
     watcherUid: uid,
     targetUid,
+    targetEmail,
     isWatching: false,
     reason,
     timestamp: Date.now(),
   };
 
-  if (targetUid) {
-    emitToUser(targetUid, null, "friend_watch_status", watchPayload);
-    if (reason === "lost_internet") {
-      emitToUser(targetUid, null, "friend_partner_lost_internet", {
-        roomId: targetRoomId,
-        droppedUid: uid,
-        reason,
-        message: "User lost connection.",
-        timestamp: Date.now(),
-      });
-    } else {
-      emitToUser(targetUid, null, "friend_partner_left_chat", {
-        roomId: targetRoomId,
-        droppedUid: uid,
-        reason,
-        timestamp: Date.now(),
-      });
-    }
-  }
-
   io.to(targetRoomId).emit("friend_watch_status", watchPayload);
+  if (targetUid || targetEmail) {
+    emitToUser(targetUid, targetEmail, "friend_watch_status", watchPayload);
+    emitToUser(targetUid, targetEmail, "friend_partner_left_chat", {
+      roomId: targetRoomId,
+      droppedUid: uid,
+      reason,
+      timestamp: Date.now(),
+    });
+  }
 }
 
 // ==============================================================
-// 💓 HEARTBEAT & SILENT INTERNET-DROP MONITOR (RUNS EVERY 3 SECONDS)
+// 💓 SMART STALE-CONNECTION CLEANUP (NEVER DROPS LIVE CONNECTED SOCKETS OR CALLS)
 // ==============================================================
 setInterval(() => {
   const now = Date.now();
   for (const [uid, user] of onlineUsers.entries()) {
     if (!user.currentRoomId) continue;
+    if (user.inCall) continue; // Never heartbeat-drop an active call
     if (user.protectedUntil && now < user.protectedUntil) continue;
 
+    // If Socket.IO itself is still connected, keep user alive!
+    const liveSock = user.socketId ? io.sockets.sockets.get(user.socketId) : null;
+    if (liveSock && liveSock.connected) {
+      user.lastPing = now;
+      continue;
+    }
+
     if (now - (user.lastPing || 0) > HEARTBEAT_DROP_MS) {
-      const droppedRoomId = user.currentRoomId;
-      console.log(
-        `⚠️ [Heartbeat Timeout] User ${uid} lost connection in room ${droppedRoomId}`
-      );
-      handleUserLeavingRoom(uid, droppedRoomId, "lost_internet");
+      handleUserLeavingRoom(uid, user.currentRoomId, "timeout");
+      onlineUsers.delete(uid);
     }
   }
-}, 3000);
+}, 5000);
 
 // ==============================================================
 // 🌐 HTTP HEALTH & MANUAL SWEEP ENDPOINTS
@@ -281,13 +308,15 @@ app.post("/cleanup-expired", async (req, res) => {
 // 🔌 SOCKET.IO EVENT HANDLERS
 // ==============================================================
 io.on("connection", (socket) => {
-  // 1. Register user upon app open / login / reconnect
+  // 1. Register user (cancels any reconnect grace timer & immediately pushes current Live Watchers)
   socket.on("friend_register_user", (data = {}, ack) => {
     const { uid, email, name, image, isVip } = data;
     if (!uid) {
       ack?.({ ok: false, error: "uid required" });
       return;
     }
+
+    cancelPendingDisconnect(uid);
 
     const emailLower = email ? String(email).toLowerCase() : null;
     const prev = onlineUsers.get(uid);
@@ -299,12 +328,13 @@ io.on("connection", (socket) => {
     const userRecord = {
       socketId: socket.id,
       uid,
-      email: emailLower,
+      email: emailLower || prev?.email || null,
       name: name || prev?.name || "User",
       image: image || prev?.image || null,
       isVip: Boolean(isVip ?? prev?.isVip),
       currentRoomId: prev?.currentRoomId || null,
       targetUid: prev?.targetUid || null,
+      targetEmail: prev?.targetEmail || null,
       inCall: Boolean(prev?.inCall),
       protectedUntil: prev?.protectedUntil || 0,
       lastPing: Date.now(),
@@ -312,41 +342,34 @@ io.on("connection", (socket) => {
 
     onlineUsers.set(uid, userRecord);
     socketToUid.set(socket.id, uid);
-    if (emailLower) emailToUid.set(emailLower, uid);
+    if (userRecord.email) emailToUid.set(userRecord.email, uid);
 
     if (userRecord.currentRoomId) {
       socket.join(userRecord.currentRoomId);
     }
 
-    ack?.({ ok: true, onlineCount: onlineUsers.size });
+    // Immediately push current live watchers list so FriendListScreen updates in 0ms
+    const watchers = getWatchersForUser(uid, userRecord.email);
+    socket.emit("friend_watch_list", { targetUid: uid, watchers });
+
+    ack?.({ ok: true, onlineCount: onlineUsers.size, watchers });
   });
 
-  // 2. Query who is currently waiting in chat rooms with me (Powers My Friends "Live 👀" tab)
+  // 2. Query who is currently waiting in chat rooms with me ("Live 👀")
   socket.on("friend_get_live_watchers", (data = {}, ack) => {
     const myUid = data.uid || socketToUid.get(socket.id);
+    const me = myUid ? onlineUsers.get(myUid) : null;
+    const myEmailLower =
+      me?.email || (data.email ? String(data.email).toLowerCase() : null);
     if (!myUid) {
       ack?.({ watchers: [] });
       return;
     }
-
-    const watchers = [];
-    for (const [uid, u] of onlineUsers.entries()) {
-      if (uid !== myUid && u.targetUid === myUid && u.currentRoomId) {
-        watchers.push({
-          watcherUid: u.uid,
-          email: u.email,
-          name: u.name,
-          image: u.image,
-          roomId: u.currentRoomId,
-          isVip: u.isVip,
-          updatedAt: u.lastPing,
-        });
-      }
-    }
+    const watchers = getWatchersForUser(myUid, myEmailLower);
     ack?.({ watchers });
   });
 
-  // 3. Join Friend Chat Room + Publish Live Watcher Presence
+  // 3. Join Friend Chat Room + Publish Live Watcher Presence Instantly
   socket.on("friend_watch_join", (data = {}, ack) => {
     const {
       roomId,
@@ -369,8 +392,13 @@ io.on("connection", (socket) => {
       return;
     }
 
+    cancelPendingDisconnect(uid);
+
     const emailLower = email ? String(email).toLowerCase() : null;
-    const resolvedTargetUser = getUserByUidOrEmail(targetUid, targetEmail);
+    const targetEmailLower = targetEmail
+      ? String(targetEmail).toLowerCase()
+      : null;
+    const resolvedTargetUser = getUserByUidOrEmail(targetUid, targetEmailLower);
     const resolvedTargetUid = targetUid || resolvedTargetUser?.uid || null;
 
     const existing = onlineUsers.get(uid) || {};
@@ -389,6 +417,7 @@ io.on("connection", (socket) => {
       isVip: Boolean(isVip ?? existing.isVip),
       currentRoomId: roomId,
       targetUid: resolvedTargetUid,
+      targetEmail: targetEmailLower || resolvedTargetUser?.email || null,
       lastPing: Date.now(),
     };
 
@@ -416,6 +445,7 @@ io.on("connection", (socket) => {
       roomId,
       watcherUid: uid,
       targetUid: resolvedTargetUid,
+      targetEmail: userRecord.targetEmail,
       name: userRecord.name,
       email: userRecord.email,
       image: userRecord.image,
@@ -424,11 +454,12 @@ io.on("connection", (socket) => {
       timestamp: Date.now(),
     };
 
+    // Notify partner inside the room AND on My Friends screen
     socket.to(roomId).emit("friend_watch_status", watchPayload);
-    if (resolvedTargetUid || targetEmail) {
+    if (resolvedTargetUid || userRecord.targetEmail) {
       emitToUser(
         resolvedTargetUid,
-        targetEmail,
+        userRecord.targetEmail,
         "friend_watch_status",
         watchPayload
       );
@@ -444,6 +475,7 @@ io.on("connection", (socket) => {
         roomId,
         watcherUid: partnerInRoom.uid,
         targetUid: uid,
+        targetEmail: userRecord.email,
         name: partnerInRoom.name,
         email: partnerInRoom.email,
         image: partnerInRoom.image,
@@ -461,20 +493,21 @@ io.on("connection", (socket) => {
     });
   });
 
-  // 4. Explicit Leave Room (Back button / Background / Unmount)
+  // 4. Explicit Leave Room (Back Button / Unmount)
   socket.on("friend_user_left_chat", (data = {}) => {
     const uid =
       data.watcherUid || data.senderUid || socketToUid.get(socket.id);
     if (!uid) return;
     const roomId = data.roomId || onlineUsers.get(uid)?.currentRoomId;
     if (roomId) socket.leave(roomId);
-    handleUserLeavingRoom(uid, roomId, data.reason || "left_chat");
+    handleUserLeavingRoom(uid, roomId, data.reason || "back_button");
   });
 
-  // 5. Heartbeat Ping (Every 2s while inside FriendListCallService)
+  // 5. Heartbeat Ping
   socket.on("friend_ping", (data = {}) => {
     const uid = data.uid || socketToUid.get(socket.id);
     if (!uid) return;
+    cancelPendingDisconnect(uid);
     const user = onlineUsers.get(uid);
     if (user) {
       user.lastPing = Date.now();
@@ -492,7 +525,7 @@ io.on("connection", (socket) => {
     const uid = data.uid || socketToUid.get(socket.id);
     const user = onlineUsers.get(uid);
     if (!user) return;
-    const durationMs = Number(data.durationMs) || 25000;
+    const durationMs = Number(data.durationMs) || 35000;
     user.protectedUntil = data.active ? Date.now() + durationMs : 0;
     if (data.roomId) {
       socket.to(data.roomId).emit("friend_call_signal", {
@@ -511,67 +544,58 @@ io.on("connection", (socket) => {
     if (user) user.inCall = Boolean(data.inCall);
   });
 
-  // 8. Room Wipe / Lost Internet Notify
-  socket.on("friend_room_wipe", (data = {}) => {
-    const uid = data.senderUid || socketToUid.get(socket.id);
-    const roomId = data.roomId || onlineUsers.get(uid)?.currentRoomId;
-    if (uid && roomId) {
-      handleUserLeavingRoom(uid, roomId, data.reason || "lost_internet");
+  // 8. Instant Block / Unblock Sync Across Both Devices
+  socket.on("friend_block_status", (data = {}) => {
+    const { roomId, targetUid, targetEmail, blocked } = data;
+    const senderUid = data.senderUid || socketToUid.get(socket.id);
+    const packet = {
+      roomId,
+      senderUid,
+      senderEmail: data.senderEmail,
+      blocked: Boolean(blocked),
+      timestamp: Date.now(),
+    };
+    if (roomId) socket.to(roomId).emit("friend_block_status", packet);
+    if (targetUid || targetEmail) {
+      emitToUser(targetUid, targetEmail, "friend_block_status", packet);
     }
   });
 
   // ==============================================================
-  // 📡 CHAT WEBRTC SIGNALING (ZERO FIRESTORE READS/WRITES)
+  // 📡 CHAT & CALL WEBRTC SIGNALING + SEAMLESS ICE RESTART
   // ==============================================================
   socket.on("friend_chat_webrtc_offer", (data = {}) => {
-    const { roomId, offer, offerId, role, senderUid, senderEmail } = data;
-    if (!roomId || !offer) return;
-    socket.to(roomId).emit("friend_chat_webrtc_offer", {
-      roomId,
-      offer,
-      offerId,
-      role,
-      senderUid: senderUid || socketToUid.get(socket.id),
-      senderEmail,
-    });
-  });
-
-  socket.on("friend_chat_webrtc_answer", (data = {}) => {
-    const { roomId, answer, answerId, forOfferId, role, senderUid } = data;
-    if (!roomId || !answer) return;
-    socket.to(roomId).emit("friend_chat_webrtc_answer", {
-      roomId,
-      answer,
-      answerId,
-      forOfferId,
-      role,
-      senderUid: senderUid || socketToUid.get(socket.id),
-    });
-  });
-
-  socket.on("friend_chat_webrtc_ice", (data = {}) => {
-    const { roomId, candidate, role, senderUid } = data;
-    if (!roomId || !candidate) return;
-    socket.to(roomId).emit("friend_chat_webrtc_ice", {
-      roomId,
-      candidate,
-      role,
-      senderUid: senderUid || socketToUid.get(socket.id),
-    });
-  });
-
-  socket.on("friend_chat_ice_restart", (data = {}) => {
-    const { roomId } = data;
-    if (!roomId) return;
-    socket.to(roomId).emit("friend_chat_ice_restart", {
+    if (!data?.roomId || !data?.offer) return;
+    socket.to(data.roomId).emit("friend_chat_webrtc_offer", {
       ...data,
       senderUid: data.senderUid || socketToUid.get(socket.id),
     });
   });
 
-  // ==============================================================
-  // 📞 AUDIO & VIDEO CALL SIGNALING + LIVE FEATURES SYNC
-  // ==============================================================
+  socket.on("friend_chat_webrtc_answer", (data = {}) => {
+    if (!data?.roomId || !data?.answer) return;
+    socket.to(data.roomId).emit("friend_chat_webrtc_answer", {
+      ...data,
+      senderUid: data.senderUid || socketToUid.get(socket.id),
+    });
+  });
+
+  socket.on("friend_chat_webrtc_ice", (data = {}) => {
+    if (!data?.roomId || !data?.candidate) return;
+    socket.to(data.roomId).emit("friend_chat_webrtc_ice", {
+      ...data,
+      senderUid: data.senderUid || socketToUid.get(socket.id),
+    });
+  });
+
+  socket.on("friend_chat_ice_restart", (data = {}) => {
+    if (!data?.roomId) return;
+    socket.to(data.roomId).emit("friend_chat_ice_restart", {
+      ...data,
+      senderUid: data.senderUid || socketToUid.get(socket.id),
+    });
+  });
+
   socket.on("friend_call_signal", (data = {}) => {
     const {
       roomId,
@@ -618,9 +642,7 @@ io.on("connection", (socket) => {
         ...data,
         updatedAt: Date.now(),
       });
-      if (data.themeId) {
-        room.activeThemeId = data.themeId;
-      }
+      if (data.themeId) room.activeThemeId = data.themeId;
     }
 
     socket.to(roomId).emit("friend_call_media_sync", {
@@ -631,7 +653,7 @@ io.on("connection", (socket) => {
   });
 
   // ==============================================================
-  // 💬 HYBRID MESSAGE ROUTER (SOCKET WHEN IN ROOM, FIRESTORE ONLY WHEN OFFLINE)
+  // 💬 HYBRID MESSAGE ROUTER (ROOM-AWARE: INSTANT SOCKET WHEN IN ROOM)
   // ==============================================================
   socket.on("friend_hybrid_message", (data = {}, ack) => {
     const {
@@ -651,7 +673,6 @@ io.on("connection", (socket) => {
     const room = rooms.get(roomId);
     const targetUser = getUserByUidOrEmail(targetUid, targetEmail);
 
-    // Client already saved an offline message to Firestore seventhDb -> register room for 24h sweeper
     if (eventType === "OFFLINE_TRACK_ONLY") {
       activeOfflineRoomIds.add(roomId);
       if (targetUser && targetUser.socketId && targetUser.currentRoomId !== roomId) {
@@ -666,14 +687,17 @@ io.on("connection", (socket) => {
       return;
     }
 
-    const isTargetInRoom = Boolean(
-      targetUser &&
-        targetUser.currentRoomId === roomId &&
-        room?.members.has(targetUser.uid)
+    // Check by actual room membership (works even if targetUid hasn't resolved yet!)
+    const partnerInRoom = getPartnerInRoom(roomId, senderUid);
+    const isPartnerPresent = Boolean(
+      partnerInRoom ||
+        (targetUser &&
+          targetUser.currentRoomId === roomId &&
+          room?.members.has(targetUser.uid))
     );
 
-    if (isTargetInRoom) {
-      io.to(targetUser.socketId).emit("friend_hybrid_message", {
+    if (isPartnerPresent) {
+      socket.to(roomId).emit("friend_hybrid_message", {
         roomId,
         senderUid,
         senderEmail: data.senderEmail,
@@ -699,7 +723,6 @@ io.on("connection", (socket) => {
     ack?.({ ok: true, deliveredVia: "offline", inRoom: false });
   });
 
-  // Live theme / reaction / typing / voice-translate / gift / privacy events
   socket.on("friend_chat_event", (data = {}) => {
     const { roomId, eventType, payload } = data;
     if (!roomId || !eventType) return;
@@ -721,7 +744,7 @@ io.on("connection", (socket) => {
   });
 
   // ==============================================================
-  // 🗑️ INSTANT BACKEND DELETE OF SEEN FIRESTORE MESSAGES + EMPTY ROOM CLEANUP
+  // 🗑️ INSTANT BACKEND DELETE OF SEEN FIRESTORE MESSAGES
   // ==============================================================
   socket.on("friend_mark_firestore_seen", async (data = {}) => {
     const { roomId, messageIds } = data;
@@ -745,7 +768,6 @@ io.on("connection", (socket) => {
       });
       await batch.commit();
 
-      // Remove parent room doc if no unseen messages remain
       const remainingSnap = await colRef.limit(1).get();
       if (remainingSnap.empty) {
         await roomDocRef.delete().catch(() => {});
@@ -755,9 +777,9 @@ io.on("connection", (socket) => {
   });
 
   // ==============================================================
-  // 🔌 SOCKET DISCONNECT CLEANUP
+  // 🔌 GRACEFUL DISCONNECT (10s–18s RECONNECT WINDOW SO CALLS/CHATS NEVER FALSE-DROP)
   // ==============================================================
-  socket.on("disconnect", (reason) => {
+  socket.on("disconnect", () => {
     const uid = socketToUid.get(socket.id);
     socketToUid.delete(socket.id);
     if (!uid) return;
@@ -766,25 +788,29 @@ io.on("connection", (socket) => {
     if (!user || user.socketId !== socket.id) return;
 
     const now = Date.now();
-    if (user.protectedUntil && now < user.protectedUntil) {
-      const waitMs = Math.min(12000, user.protectedUntil - now + 1000);
-      setTimeout(() => {
-        const latest = onlineUsers.get(uid);
-        if (latest && latest.socketId === socket.id) {
-          handleUserLeavingRoom(uid, latest.currentRoomId, "lost_internet");
-          onlineUsers.delete(uid);
+    const baseGrace = user.inCall
+      ? CALL_DISCONNECT_GRACE_MS
+      : CHAT_DISCONNECT_GRACE_MS;
+    const protectedGrace =
+      user.protectedUntil && user.protectedUntil > now
+        ? Math.min(35000, user.protectedUntil - now + 2000)
+        : 0;
+    const waitMs = Math.max(baseGrace, protectedGrace);
+
+    cancelPendingDisconnect(uid);
+    const timer = setTimeout(() => {
+      disconnectTimers.delete(uid);
+      const latest = onlineUsers.get(uid);
+      // Only remove if they did NOT reconnect with a new socket during the grace window
+      if (latest && latest.socketId === socket.id) {
+        if (latest.currentRoomId) {
+          handleUserLeavingRoom(uid, latest.currentRoomId, "disconnected");
         }
-      }, waitMs);
-      return;
-    }
+        onlineUsers.delete(uid);
+      }
+    }, waitMs);
 
-    if (user.currentRoomId) {
-      const dropReason =
-        reason === "client namespace disconnect" ? "left_chat" : "lost_internet";
-      handleUserLeavingRoom(uid, user.currentRoomId, dropReason);
-    }
-
-    onlineUsers.delete(uid);
+    disconnectTimers.set(uid, timer);
   });
 });
 
