@@ -267,10 +267,9 @@ setInterval(() => {
   const now = Date.now();
   for (const [uid, user] of onlineUsers.entries()) {
     if (!user.currentRoomId) continue;
-    if (user.inCall) continue; // Never heartbeat-drop an active call
+    if (user.inCall) continue;
     if (user.protectedUntil && now < user.protectedUntil) continue;
 
-    // If Socket.IO itself is still connected, keep user alive!
     const liveSock = user.socketId ? io.sockets.sockets.get(user.socketId) : null;
     if (liveSock && liveSock.connected) {
       user.lastPing = now;
@@ -308,7 +307,7 @@ app.post("/cleanup-expired", async (req, res) => {
 // 🔌 SOCKET.IO EVENT HANDLERS
 // ==============================================================
 io.on("connection", (socket) => {
-  // 1. Register user (cancels any reconnect grace timer & immediately pushes current Live Watchers)
+  // 1. Register user (cancels reconnect grace timer & immediately pushes Live Watchers)
   socket.on("friend_register_user", (data = {}, ack) => {
     const { uid, email, name, image, isVip } = data;
     if (!uid) {
@@ -348,7 +347,6 @@ io.on("connection", (socket) => {
       socket.join(userRecord.currentRoomId);
     }
 
-    // Immediately push current live watchers list so FriendListScreen updates in 0ms
     const watchers = getWatchersForUser(uid, userRecord.email);
     socket.emit("friend_watch_list", { targetUid: uid, watchers });
 
@@ -454,7 +452,6 @@ io.on("connection", (socket) => {
       timestamp: Date.now(),
     };
 
-    // Notify partner inside the room AND on My Friends screen
     socket.to(roomId).emit("friend_watch_status", watchPayload);
     if (resolvedTargetUid || userRecord.targetEmail) {
       emitToUser(
@@ -687,7 +684,6 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // Check by actual room membership (works even if targetUid hasn't resolved yet!)
     const partnerInRoom = getPartnerInRoom(roomId, senderUid);
     const isPartnerPresent = Boolean(
       partnerInRoom ||
@@ -777,7 +773,7 @@ io.on("connection", (socket) => {
   });
 
   // ==============================================================
-  // 🔌 GRACEFUL DISCONNECT (10s–18s RECONNECT WINDOW SO CALLS/CHATS NEVER FALSE-DROP)
+  // 🔌 GRACEFUL DISCONNECT (10s–18s RECONNECT WINDOW — ZERO FALSE DROPS)
   // ==============================================================
   socket.on("disconnect", () => {
     const uid = socketToUid.get(socket.id);
@@ -801,7 +797,6 @@ io.on("connection", (socket) => {
     const timer = setTimeout(() => {
       disconnectTimers.delete(uid);
       const latest = onlineUsers.get(uid);
-      // Only remove if they did NOT reconnect with a new socket during the grace window
       if (latest && latest.socketId === socket.id) {
         if (latest.currentRoomId) {
           handleUserLeavingRoom(uid, latest.currentRoomId, "disconnected");
